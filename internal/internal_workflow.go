@@ -1,4 +1,5 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2017-2020 Uber Technologies Inc.
+// Portions of the Software are attributed to Copyright (c) 2020 Temporal Technologies Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -33,12 +34,12 @@ import (
 	"unicode"
 
 	"github.com/robfig/cron"
-	"github.com/uber-go/tally"
 	"go.uber.org/atomic"
 	"go.uber.org/cadence/.gen/go/shared"
 	s "go.uber.org/cadence/.gen/go/shared"
 	"go.uber.org/cadence/internal/common"
 	"go.uber.org/cadence/internal/common/metrics"
+	"go.uber.org/cadence/internal/common/util"
 	"go.uber.org/zap"
 )
 
@@ -116,8 +117,7 @@ type (
 		closed          bool               // true if channel is closed.
 		recValue        *interface{}       // Used only while receiving value, this is used as pre-fetch buffer value from the channel.
 		dataConverter   DataConverter      // for decode data
-		scope           tally.Scope        // Used to send metrics
-		logger          *zap.Logger
+		env             workflowEnvironment
 	}
 
 	// Single case statement of the Select
@@ -234,10 +234,13 @@ type (
 )
 
 const (
-	workflowEnvironmentContextKey = "workflowEnv"
-	workflowResultContextKey      = "workflowResult"
-	coroutinesContextKey          = "coroutines"
-	workflowEnvOptionsContextKey  = "wfEnvOptions"
+	workflowEnvironmentContextKey    = "workflowEnv"
+	workflowInterceptorsContextKey   = "workflowInterceptor"
+	localActivityFnContextKey        = "localActivityFn"
+	workflowEnvInterceptorContextKey = "envInterceptor"
+	workflowResultContextKey         = "workflowResult"
+	coroutinesContextKey             = "coroutines"
+	workflowEnvOptionsContextKey     = "wfEnvOptions"
 )
 
 // Assert that structs do indeed implement the interfaces
@@ -265,6 +268,28 @@ func getWorkflowEnvironment(ctx Context) workflowEnvironment {
 	return wc.(workflowEnvironment)
 }
 
+func getEnvInterceptor(ctx Context) *workflowEnvironmentInterceptor {
+	wc := ctx.Value(workflowEnvInterceptorContextKey)
+	if wc == nil {
+		panic("getWorkflowContext: Not a workflow context")
+	}
+	return wc.(*workflowEnvironmentInterceptor)
+}
+
+type workflowEnvironmentInterceptor struct {
+	env                  workflowEnvironment
+	interceptorChainHead WorkflowInterceptor
+	fn                   interface{}
+}
+
+func getWorkflowInterceptor(ctx Context) WorkflowInterceptor {
+	wc := ctx.Value(workflowInterceptorsContextKey)
+	if wc == nil {
+		panic("getWorkflowInterceptor: Not a workflow context")
+	}
+	return wc.(WorkflowInterceptor)
+}
+
 func (f *futureImpl) Get(ctx Context, value interface{}) error {
 	more := f.channel.Receive(ctx, nil)
 	if more {
@@ -281,7 +306,7 @@ func (f *futureImpl) Get(ctx Context, value interface{}) error {
 		return errors.New("value parameter is not a pointer")
 	}
 
-	if blob, ok := f.value.([]byte); ok && !isTypeByteSlice(reflect.TypeOf(value)) {
+	if blob, ok := f.value.([]byte); ok && !util.IsTypeByteSlice(reflect.TypeOf(value)) {
 		if err := decodeArg(getDataConverterFromWorkflowContext(ctx), blob, value); err != nil {
 			return err
 		}
@@ -391,8 +416,11 @@ func (f *childWorkflowFutureImpl) SignalChildWorkflow(ctx Context, signalName st
 	return signalExternalWorkflow(ctx, childExec.ID, "", signalName, data, childWorkflowOnly)
 }
 
-func newWorkflowContext(env workflowEnvironment) Context {
+func newWorkflowContext(env workflowEnvironment, interceptors WorkflowInterceptor, envInterceptor *workflowEnvironmentInterceptor) Context {
 	rootCtx := WithValue(background, workflowEnvironmentContextKey, env)
+	rootCtx = WithValue(rootCtx, workflowEnvInterceptorContextKey, envInterceptor)
+	rootCtx = WithValue(rootCtx, workflowInterceptorsContextKey, interceptors)
+
 	var resultPtr *workflowResult
 	rootCtx = WithValue(rootCtx, workflowResultContextKey, &resultPtr)
 
@@ -410,8 +438,19 @@ func newWorkflowContext(env workflowEnvironment) Context {
 	return rootCtx
 }
 
+func newWorkflowInterceptors(env workflowEnvironment, factories []WorkflowInterceptorFactory) (WorkflowInterceptor, *workflowEnvironmentInterceptor) {
+	envInterceptor := &workflowEnvironmentInterceptor{env: env}
+	var interceptor WorkflowInterceptor = envInterceptor
+	for i := len(factories) - 1; i >= 0; i-- {
+		interceptor = factories[i].NewInterceptor(env.WorkflowInfo(), interceptor)
+	}
+	envInterceptor.interceptorChainHead = interceptor
+	return interceptor, envInterceptor
+}
+
 func (d *syncWorkflowDefinition) Execute(env workflowEnvironment, header *shared.Header, input []byte) {
-	dispatcher, rootCtx := newDispatcher(newWorkflowContext(env), func(ctx Context) {
+	interceptors, envInterceptor := newWorkflowInterceptors(env, env.GetWorkflowInterceptors())
+	dispatcher, rootCtx := newDispatcher(newWorkflowContext(env, interceptors, envInterceptor), func(ctx Context) {
 		r := &workflowResult{}
 
 		// We want to execute the user workflow definition from the first decision task started,
@@ -728,8 +767,8 @@ func (c *channelImpl) assignValue(from interface{}, to interface{}) error {
 	err := decodeAndAssignValue(c.dataConverter, from, to)
 	//add to metrics
 	if err != nil {
-		c.logger.Error(fmt.Sprintf("Corrupt signal received on channel %s. Error deserializing", c.name), zap.Error(err))
-		c.scope.Counter(metrics.CorruptedSignalsCounter).Inc(1)
+		c.env.GetLogger().Error(fmt.Sprintf("Corrupt signal received on channel %s. Error deserializing", c.name), zap.Error(err))
+		c.env.GetMetricsScope().Counter(metrics.CorruptedSignalsCounter).Inc(1)
 	}
 	return err
 }
@@ -1077,11 +1116,11 @@ func (s *selectorImpl) Select(ctx Context) {
 }
 
 // NewWorkflowDefinition creates a WorkflowDefinition from a Workflow
-func newWorkflowDefinition(workflow workflow) workflowDefinition {
+func newSyncWorkflowDefinition(workflow workflow) *syncWorkflowDefinition {
 	return &syncWorkflowDefinition{workflow: workflow}
 }
 
-func getValidatedWorkflowFunction(workflowFunc interface{}, args []interface{}, dataConverter DataConverter) (*WorkflowType, []byte, error) {
+func getValidatedWorkflowFunction(workflowFunc interface{}, args []interface{}, dataConverter DataConverter, r *registry) (*WorkflowType, []byte, error) {
 	fnName := ""
 	fType := reflect.TypeOf(workflowFunc)
 	switch getKind(fType) {
@@ -1092,14 +1131,11 @@ func getValidatedWorkflowFunction(workflowFunc interface{}, args []interface{}, 
 		if err := validateFunctionArgs(workflowFunc, args, true); err != nil {
 			return nil, nil, err
 		}
-		fnName = getFunctionName(workflowFunc)
-		if alias, ok := getHostEnvironment().getWorkflowAlias(fnName); ok {
-			fnName = alias
-		}
+		fnName = getWorkflowFunctionName(r, workflowFunc)
 
 	default:
 		return nil, nil, fmt.Errorf(
-			"Invalid type 'workflowFunc' parameter provided, it can be either worker function or name of the worker type: %v",
+			"invalid type 'workflowFunc' parameter provided, it can be either worker function or name of the worker type: %v",
 			workflowFunc)
 	}
 
@@ -1187,6 +1223,11 @@ func getDataConverterFromWorkflowContext(ctx Context) DataConverter {
 	return options.dataConverter
 }
 
+func getRegistryFromWorkflowContext(ctx Context) *registry {
+	env := getWorkflowEnvironment(ctx)
+	return env.GetRegistry()
+}
+
 func getContextPropagatorsFromWorkflowContext(ctx Context) []ContextPropagator {
 	options := getWorkflowEnvOptions(ctx)
 	return options.contextPropagators
@@ -1243,7 +1284,7 @@ func (d *decodeFutureImpl) Get(ctx Context, value interface{}) error {
 		return errors.New("value parameter is not a pointer")
 	}
 
-	err := deSerializeFunctionResult(d.fn, d.futureImpl.value.([]byte), value, getDataConverterFromWorkflowContext(ctx))
+	err := deSerializeFunctionResult(d.fn, d.futureImpl.value.([]byte), value, getDataConverterFromWorkflowContext(ctx), d.channel.env.GetRegistry())
 	if err != nil {
 		return err
 	}
@@ -1314,7 +1355,7 @@ func (h *queryHandler) execute(input []byte) (result []byte, err error) {
 	fnType := reflect.TypeOf(h.fn)
 	var args []reflect.Value
 
-	if fnType.NumIn() == 1 && isTypeByteSlice(fnType.In(0)) {
+	if fnType.NumIn() == 1 && util.IsTypeByteSlice(fnType.In(0)) {
 		args = append(args, reflect.ValueOf(input))
 	} else {
 		decoded, err := decodeArgs(h.dataConverter, fnType, input)

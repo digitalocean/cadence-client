@@ -1,4 +1,5 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2017-2020 Uber Technologies Inc.
+// Portions of the Software are attributed to Copyright (c) 2020 Temporal Technologies Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -157,7 +158,9 @@ type (
 	// testWorkflowEnvironmentImpl is the environment that runs the workflow/activity unit tests.
 	testWorkflowEnvironmentImpl struct {
 		*testWorkflowEnvironmentShared
-		parentEnv *testWorkflowEnvironmentImpl
+		parentEnv            *testWorkflowEnvironmentImpl
+		registry             *registry
+		workflowInterceptors []WorkflowInterceptorFactory
 
 		workflowInfo   *WorkflowInfo
 		workflowDef    workflowDefinition
@@ -188,7 +191,23 @@ type (
 	}
 )
 
-func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite) *testWorkflowEnvironmentImpl {
+// make sure interface is implemented
+var _ workflowEnvironment = (*testWorkflowEnvironmentImpl)(nil)
+
+func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *registry) *testWorkflowEnvironmentImpl {
+	var r *registry
+	if parentRegistry == nil {
+		r = newRegistry()
+		r.RegisterActivityWithOptions(sessionCreationActivity, RegisterActivityOptions{
+			Name: sessionCreationActivityName,
+		})
+		r.RegisterActivityWithOptions(sessionCompletionActivity, RegisterActivityOptions{
+			Name: sessionCompletionActivityName,
+		})
+	} else {
+		r = parentRegistry
+	}
+
 	env := &testWorkflowEnvironmentImpl{
 		testWorkflowEnvironmentShared: &testWorkflowEnvironmentShared{
 			testSuite:                  s,
@@ -220,6 +239,7 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite) *testWorkflowEnvironme
 			ExecutionStartToCloseTimeoutSeconds: 1,
 			TaskStartToCloseTimeoutSeconds:      1,
 		},
+		registry: r,
 
 		changeVersions: make(map[string]Version),
 		openSessions:   make(map[string]*SessionInfo),
@@ -314,12 +334,13 @@ func (env *testWorkflowEnvironmentImpl) setStartTime(startTime time.Time) {
 
 func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(params *executeWorkflowParams, callback resultHandler, startedHandler func(r WorkflowExecution, e error)) (*testWorkflowEnvironmentImpl, error) {
 	// create a new test env
-	childEnv := newTestWorkflowEnvironmentImpl(env.testSuite)
+	childEnv := newTestWorkflowEnvironmentImpl(env.testSuite, env.registry)
 	childEnv.parentEnv = env
 	childEnv.startedHandler = startedHandler
 	childEnv.testWorkflowEnvironmentShared = env.testWorkflowEnvironmentShared
 	childEnv.workerOptions = env.workerOptions
 	childEnv.workerOptions.DataConverter = params.dataConverter
+	childEnv.registry = env.registry
 
 	if params.workflowID == "" {
 		params.workflowID = env.workflowInfo.WorkflowExecution.RunID + "_" + getStringID(env.nextID())
@@ -329,6 +350,7 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(param
 		cronSchedule = &params.cronSchedule
 	}
 	// set workflow info data for child workflow
+	childEnv.header = params.header
 	childEnv.workflowInfo.Attempt = params.attempt
 	childEnv.workflowInfo.WorkflowExecution.ID = params.workflowID
 	childEnv.workflowInfo.WorkflowExecution.RunID = params.workflowID + "_RunID"
@@ -388,6 +410,7 @@ func (env *testWorkflowEnvironmentImpl) setWorkerOptions(options WorkerOptions) 
 	if len(options.ContextPropagators) > 0 {
 		env.workerOptions.ContextPropagators = options.ContextPropagators
 	}
+	env.workflowInterceptors = options.WorkflowInterceptorChainFactories
 }
 
 func (env *testWorkflowEnvironmentImpl) setWorkerStopChannel(c chan struct{}) {
@@ -396,7 +419,7 @@ func (env *testWorkflowEnvironmentImpl) setWorkerStopChannel(c chan struct{}) {
 
 func (env *testWorkflowEnvironmentImpl) setActivityTaskList(tasklist string, activityFns ...interface{}) {
 	for _, activityFn := range activityFns {
-		fnName := getFunctionName(activityFn)
+		fnName := getActivityFunctionName(env.registry, activityFn)
 		taskListActivity, ok := env.taskListSpecificActivities[fnName]
 		if !ok {
 			taskListActivity = &taskListSpecificActivity{fn: activityFn, taskLists: make(map[string]struct{})}
@@ -407,7 +430,11 @@ func (env *testWorkflowEnvironmentImpl) setActivityTaskList(tasklist string, act
 }
 
 func (env *testWorkflowEnvironmentImpl) executeWorkflow(workflowFn interface{}, args ...interface{}) {
-	workflowType, input, err := getValidatedWorkflowFunction(workflowFn, args, env.GetDataConverter())
+	fType := reflect.TypeOf(workflowFn)
+	if getKind(fType) == reflect.Func {
+		env.RegisterWorkflowWithOptions(workflowFn, RegisterWorkflowOptions{DisableAlreadyRegisteredCheck: true})
+	}
+	workflowType, input, err := getValidatedWorkflowFunction(workflowFn, args, env.GetDataConverter(), env.GetRegistry())
 	if err != nil {
 		panic(err)
 	}
@@ -418,7 +445,8 @@ func (env *testWorkflowEnvironmentImpl) executeWorkflowInternal(delayStart time.
 	env.locker.Lock()
 	if env.workflowInfo.WorkflowType.Name != workflowTypeNotSpecified {
 		// Current TestWorkflowEnvironment only support to run one workflow.
-		// Created task to support testing multiple workflows with one env instancehttps://github.com/uber-go/cadence-client/issues/616
+		// Created task to support testing multiple workflows with one env instance
+		// https://github.com/uber-go/cadence-client/issues/616
 		panic(fmt.Sprintf("Current TestWorkflowEnvironment is used to execute %v. Please create a new TestWorkflowEnvironment for %v.", env.workflowInfo.WorkflowType.Name, workflowType))
 	}
 	env.workflowInfo.WorkflowType.Name = workflowType
@@ -460,24 +488,28 @@ func (env *testWorkflowEnvironmentImpl) executeWorkflowInternal(delayStart time.
 }
 
 func (env *testWorkflowEnvironmentImpl) getWorkflowDefinition(wt WorkflowType) (workflowDefinition, error) {
-	hostEnv := getHostEnvironment()
-	wf, ok := hostEnv.getWorkflowFn(wt.Name)
+	wf, ok := env.registry.getWorkflowFn(wt.Name)
 	if !ok {
-		supported := strings.Join(hostEnv.getRegisteredWorkflowTypes(), ", ")
-		return nil, fmt.Errorf("Unable to find workflow type: %v. Supported types: [%v]", wt.Name, supported)
+		supported := strings.Join(env.registry.getRegisteredWorkflowTypes(), ", ")
+		return nil, fmt.Errorf("unable to find workflow type: %v. Supported types: [%v]", wt.Name, supported)
 	}
 	wd := &workflowExecutorWrapper{
-		workflowExecutor: &workflowExecutor{name: wt.Name, fn: wf},
+		workflowExecutor: &workflowExecutor{workflowType: wt.Name, fn: wf},
 		env:              env,
 	}
-	return newWorkflowDefinition(wd), nil
+	return newSyncWorkflowDefinition(wd), nil
 }
 
 func (env *testWorkflowEnvironmentImpl) executeActivity(
 	activityFn interface{},
 	args ...interface{},
 ) (Value, error) {
-	activityType, input, err := getValidatedActivityFunction(activityFn, args, env.GetDataConverter())
+	activityType, err := getValidatedActivityFunction(activityFn, args, env.registry)
+	if err != nil {
+		panic(err)
+	}
+
+	input, err := encodeArgs(env.GetDataConverter(), args)
 	if err != nil {
 		panic(err)
 	}
@@ -756,7 +788,7 @@ func (env *testWorkflowEnvironmentImpl) Complete(result []byte, err error) {
 
 	if err != nil {
 		switch err := err.(type) {
-		case *CanceledError, *ContinueAsNewError, *TimeoutError:
+		case *CanceledError, *ContinueAsNewError, *TimeoutError, *shared.WorkflowExecutionAlreadyStartedError:
 			env.testError = err
 		case *workflowPanicError:
 			env.testError = newPanicError(err.value, err.stackTrace)
@@ -1044,8 +1076,8 @@ func getRetryBackoffFromThriftRetryPolicy(tp *shared.RetryPolicy, attempt int32,
 func (env *testWorkflowEnvironmentImpl) ExecuteLocalActivity(params executeLocalActivityParams, callback laResultHandler) *localActivityInfo {
 	activityID := getStringID(env.nextID())
 	wOptions := augmentWorkerOptions(env.workerOptions)
-	ae := &activityExecutor{name: getFunctionName(params.ActivityFn), fn: params.ActivityFn}
-	if at, _, _ := getValidatedActivityFunction(params.ActivityFn, params.InputArgs, wOptions.DataConverter); at != nil {
+	ae := &activityExecutor{name: getActivityFunctionName(env.registry, params.ActivityFn), fn: params.ActivityFn}
+	if at, _ := getValidatedActivityFunction(params.ActivityFn, params.InputArgs, env.registry); at != nil {
 		// local activity could be registered, if so use the registered name. This name is only used to find a mock.
 		ae.name = at.Name
 	}
@@ -1086,7 +1118,7 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelLocalActivity(activityID st
 		env.logger.Debug("RequestCancelLocalActivity failed, LocalActivity not exists or already completed.", zap.String(tagActivityID, activityID))
 		return
 	}
-	activityInfo := env.getActivityInfo(activityID, getFunctionName(task.params.ActivityFn))
+	activityInfo := env.getActivityInfo(activityID, getActivityFunctionName(env.registry, task.params.ActivityFn))
 	env.logger.Debug("RequestCancelLocalActivity", zap.String(tagActivityID, activityID))
 	delete(env.localActivities, activityID)
 	env.postCallback(func() {
@@ -1158,7 +1190,7 @@ func (env *testWorkflowEnvironmentImpl) handleActivityResult(activityID string, 
 
 func (env *testWorkflowEnvironmentImpl) handleLocalActivityResult(result *localActivityResult) {
 	activityID := result.task.activityID
-	activityType := getFunctionName(result.task.params.ActivityFn)
+	activityType := getActivityFunctionName(env.registry, result.task.params.ActivityFn)
 	env.logger.Debug(fmt.Sprintf("handleLocalActivityResult: Err: %v, Result: %v.", result.err, string(result.result)),
 		zap.String(tagActivityID, activityID), zap.String(tagActivityType, activityType))
 
@@ -1271,13 +1303,19 @@ func (w *workflowExecutorWrapper) Execute(ctx Context, input []byte) (result []b
 		env.runningCount++
 	}
 
-	m := &mockWrapper{env: env, name: w.name, fn: w.fn, isWorkflow: true, dataConverter: env.GetDataConverter()}
+	m := &mockWrapper{
+		env:           env,
+		name:          w.workflowType,
+		fn:            w.fn,
+		isWorkflow:    true,
+		dataConverter: env.GetDataConverter(),
+	}
 	// This method is called by workflow's dispatcher. In this test suite, it is run in the main loop. We cannot block
 	// the main loop, but the mock could block if it is configured to wait. So we need to use a separate goroutinue to
 	// run the mock, and resume after mock call returns.
 	mockReadyChannel := NewChannel(ctx)
 	// make a copy of the context for getMockReturn() call to avoid race condition
-	ctxCopy := newWorkflowContext(w.env)
+	ctxCopy := newWorkflowContext(w.env, nil, nil)
 	go func() {
 		// getMockReturn could block if mock is configured to wait. The returned mockRet is what has been configured
 		// for the mock by using MockCallWrapper.Return(). The mockRet could be mock values or mock function. We process
@@ -1452,7 +1490,7 @@ func (m *mockWrapper) executeMock(ctx interface{}, input []byte, mockRet mock.Ar
 	if mockFn := m.getMockFn(mockRet); mockFn != nil {
 		// we found a mock function that matches to actual function, so call that mockFn
 		if m.isWorkflow {
-			executor := &workflowExecutor{name: fnName, fn: mockFn}
+			executor := &workflowExecutor{workflowType: fnName, fn: mockFn}
 			return executor.Execute(ctx.(Context), input)
 		}
 		executor := &activityExecutor{name: fnName, fn: mockFn}
@@ -1494,8 +1532,8 @@ func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskList stri
 		env.sessionEnvironment = newTestSessionEnvironment(env, &params, wOptions.MaxConcurrentSessionExecutionSize)
 	}
 	params.UserContext = context.WithValue(params.UserContext, sessionEnvironmentContextKey, env.sessionEnvironment)
-
-	if len(getHostEnvironment().getRegisteredActivities()) == 0 {
+	registry := env.registry
+	if len(registry.getRegisteredActivities()) == 0 {
 		panic(fmt.Sprintf("no activity is registered for tasklist '%v'", taskList))
 	}
 
@@ -1509,7 +1547,7 @@ func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskList stri
 			}
 		}
 
-		activity, ok := getHostEnvironment().getActivity(name)
+		activity, ok := registry.GetActivity(name)
 		if !ok {
 			return nil
 		}
@@ -1527,7 +1565,7 @@ func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskList stri
 		return &activityExecutorWrapper{activityExecutor: ae, env: env}
 	}
 
-	taskHandler := newActivityTaskHandlerWithCustomProvider(env.service, params, getHostEnvironment(), getActivity)
+	taskHandler := newActivityTaskHandlerWithCustomProvider(env.service, params, registry, getActivity)
 	return taskHandler
 }
 
@@ -1592,6 +1630,22 @@ func (env *testWorkflowEnvironmentImpl) Now() time.Time {
 
 func (env *testWorkflowEnvironmentImpl) WorkflowInfo() *WorkflowInfo {
 	return env.workflowInfo
+}
+
+func (env *testWorkflowEnvironmentImpl) RegisterWorkflow(w interface{}) {
+	env.registry.RegisterWorkflow(w)
+}
+
+func (env *testWorkflowEnvironmentImpl) RegisterWorkflowWithOptions(w interface{}, options RegisterWorkflowOptions) {
+	env.registry.RegisterWorkflowWithOptions(w, options)
+}
+
+func (env *testWorkflowEnvironmentImpl) RegisterActivity(a interface{}) {
+	env.registry.RegisterActivity(a)
+}
+
+func (env *testWorkflowEnvironmentImpl) RegisterActivityWithOptions(a interface{}, options RegisterActivityOptions) {
+	env.registry.RegisterActivityWithOptions(a, options)
 }
 
 func (env *testWorkflowEnvironmentImpl) RegisterCancelHandler(handler func()) {
@@ -1929,6 +1983,14 @@ func (env *testWorkflowEnvironmentImpl) setHeartbeatDetails(details interface{})
 	env.heartbeatDetails = data
 }
 
+func (env *testWorkflowEnvironmentImpl) GetRegistry() *registry {
+	return env.registry
+}
+
+func (env *testWorkflowEnvironmentImpl) GetWorkflowInterceptors() []WorkflowInterceptorFactory {
+	return env.workflowInterceptors
+}
+
 func newTestSessionEnvironment(testWorkflowEnvironment *testWorkflowEnvironmentImpl,
 	params *workerExecutionParameters, concurrentSessionExecutionSize int) *testSessionEnvironmentImpl {
 	resourceID := params.SessionResourceID
@@ -1964,9 +2026,6 @@ func mockFnRequestCancelExternalWorkflow(domainName, workflowID, runID string) e
 func mockFnGetVersion(changeID string, minSupported, maxSupported Version) Version {
 	return DefaultVersion
 }
-
-// make sure interface is implemented
-var _ workflowEnvironment = (*testWorkflowEnvironmentImpl)(nil)
 
 type testReporter struct {
 	logger *zap.Logger

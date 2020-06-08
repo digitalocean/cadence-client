@@ -1,4 +1,5 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2017-2020 Uber Technologies Inc.
+// Portions of the Software are attributed to Copyright (c) 2020 Temporal Technologies Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +26,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +36,7 @@ import (
 	"go.uber.org/cadence"
 	"go.uber.org/cadence/.gen/go/shared"
 	"go.uber.org/cadence/client"
+	"go.uber.org/cadence/interceptors"
 	"go.uber.org/cadence/worker"
 	"go.uber.org/cadence/workflow"
 	"go.uber.org/goleak"
@@ -51,6 +54,7 @@ type IntegrationTestSuite struct {
 	worker       worker.Worker
 	seq          int64
 	taskListName string
+	tracer       *tracingInterceptorFactory
 }
 
 const (
@@ -87,12 +91,11 @@ func waitForTCP(timeout time.Duration, addr string) error {
 func (ts *IntegrationTestSuite) SetupSuite() {
 	ts.Assertions = require.New(ts.T())
 	ts.config = newConfig()
-	ts.activities = &Activities{}
+	ts.activities = newActivities()
 	ts.workflows = &Workflows{}
-	ts.registerWorkflowsAndActivities()
 	ts.Nil(waitForTCP(time.Minute, ts.config.ServiceAddr))
 	rpcClient, err := newRPCClient(ts.config.ServiceName, ts.config.ServiceAddr)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.rpcClient = rpcClient
 	ts.libClient = client.NewClient(ts.rpcClient.Interface, domainName, &client.Options{})
 	ts.registerDomain()
@@ -131,11 +134,19 @@ func (ts *IntegrationTestSuite) SetupTest() {
 	ts.activities.clearInvoked()
 	ts.taskListName = fmt.Sprintf("tl-%v", ts.seq)
 	logger, err := zap.NewDevelopment()
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.worker = worker.New(ts.rpcClient.Interface, domainName, ts.taskListName, worker.Options{
 		DisableStickyExecution: ts.config.IsStickyOff,
 		Logger:                 logger,
 	})
+	ts.tracer = newtracingInterceptorFactory()
+	options := worker.Options{
+		DisableStickyExecution:            ts.config.IsStickyOff,
+		Logger:                            logger,
+		WorkflowInterceptorChainFactories: []interceptors.WorkflowInterceptorFactory{ts.tracer},
+	}
+	ts.worker = worker.New(ts.rpcClient.Interface, domainName, ts.taskListName, options)
+	ts.registerWorkflowsAndActivities(ts.worker)
 	ts.Nil(ts.worker.Start())
 }
 
@@ -146,14 +157,18 @@ func (ts *IntegrationTestSuite) TearDownTest() {
 func (ts *IntegrationTestSuite) TestBasic() {
 	var expected []string
 	err := ts.executeWorkflow("test-basic", ts.workflows.Basic, &expected)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.EqualValues(expected, ts.activities.invoked())
+	// See https://grokbase.com/p/gg/golang-nuts/153jjj8dgg/go-nuts-fm-suffix-in-function-name-what-does-it-mean
+	// for explanation of -fm postfix.
+	ts.Equal([]string{"ExecuteWorkflow begin", "ExecuteActivity", "ExecuteActivity", "ExecuteWorkflow end"},
+		ts.tracer.GetTrace("Basic-fm"))
 }
 
 func (ts *IntegrationTestSuite) TestActivityRetryOnError() {
 	var expected []string
 	err := ts.executeWorkflow("test-activity-retry-on-error", ts.workflows.ActivityRetryOnError, &expected)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.EqualValues(expected, ts.activities.invoked())
 }
 
@@ -166,7 +181,7 @@ func (ts *IntegrationTestSuite) TestActivityRetryOnTimeoutStableError() {
 func (ts *IntegrationTestSuite) TestActivityRetryOptionsChange() {
 	var expected []string
 	err := ts.executeWorkflow("test-activity-retry-options-change", ts.workflows.ActivityRetryOptionsChange, &expected)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.EqualValues(expected, ts.activities.invoked())
 }
 
@@ -178,21 +193,21 @@ func (ts *IntegrationTestSuite) TestActivityRetryOnStartToCloseTimeout() {
 		&expected,
 		shared.TimeoutTypeStartToClose)
 
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.EqualValues(expected, ts.activities.invoked())
 }
 
 func (ts *IntegrationTestSuite) TestActivityRetryOnHBTimeout() {
 	var expected []string
 	err := ts.executeWorkflow("test-activity-retry-on-hbtimeout", ts.workflows.ActivityRetryOnHBTimeout, &expected)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.EqualValues(expected, ts.activities.invoked())
 }
 
 func (ts *IntegrationTestSuite) TestContinueAsNew() {
 	var result int
 	err := ts.executeWorkflow("test-continueasnew", ts.workflows.ContinueAsNew, &result, 4, ts.taskListName)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.Equal(999, result)
 }
 
@@ -206,7 +221,7 @@ func (ts *IntegrationTestSuite) TestContinueAsNewCarryOver() {
 		"CustomKeywordField": "searchAttr",
 	}
 	err := ts.executeWorkflowWithOption(startOptions, ts.workflows.ContinueAsNewWithOptions, &result, 4, ts.taskListName)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.Equal("memoVal,searchAttr", result)
 }
 
@@ -215,7 +230,7 @@ func (ts *IntegrationTestSuite) TestCancellation() {
 	defer cancel()
 	run, err := ts.libClient.ExecuteWorkflow(ctx,
 		ts.startWorkflowOptions("test-cancellation"), ts.workflows.Basic)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.NotNil(run)
 	ts.Nil(ts.libClient.CancelWorkflow(ctx, "test-cancellation", run.GetRunID()))
 	err = run.Get(ctx, nil)
@@ -229,9 +244,9 @@ func (ts *IntegrationTestSuite) TestStackTraceQuery() {
 	defer cancel()
 	run, err := ts.libClient.ExecuteWorkflow(ctx,
 		ts.startWorkflowOptions("test-stack-trace-query"), ts.workflows.Basic)
-	ts.Nil(err)
+	ts.NoError(err)
 	value, err := ts.libClient.QueryWorkflow(ctx, "test-stack-trace-query", run.GetRunID(), "__stack_trace")
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.NotNil(value)
 	var trace string
 	ts.Nil(value.Get(&trace))
@@ -316,7 +331,7 @@ func (ts *IntegrationTestSuite) TestWorkflowIDReuseAllowDuplicateFailedOnly2() {
 		false,
 		true,
 	)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.Equal("WORLD", result)
 }
 
@@ -331,7 +346,7 @@ func (ts *IntegrationTestSuite) TestWorkflowIDReuseAllowDuplicate() {
 		false,
 		false,
 	)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.Equal("HELLOWORLD", result)
 }
 
@@ -353,6 +368,7 @@ func (ts *IntegrationTestSuite) TestChildWFWithMemoAndSearchAttributes() {
 	ts.NoError(err)
 	ts.EqualValues([]string{"getMemoAndSearchAttr"}, ts.activities.invoked())
 	ts.Equal("memoVal, searchAttrVal", result)
+	ts.Equal([]string{"ExecuteWorkflow begin", "ExecuteChildWorkflow", "ExecuteWorkflow end"}, ts.tracer.GetTrace("ChildWorkflowSuccess-fm"))
 }
 
 func (ts *IntegrationTestSuite) TestChildWFWithParentClosePolicyTerminate() {
@@ -375,14 +391,17 @@ func (ts *IntegrationTestSuite) TestChildWFWithParentClosePolicyAbandon() {
 
 func (ts *IntegrationTestSuite) TestActivityCancelUsingReplay() {
 	logger, err := zap.NewDevelopment()
-	err = worker.ReplayPartialWorkflowHistoryFromJSONFile(logger, "fixtures/activity.cancel.sm.repro.json", 12)
-	ts.Nil(err)
+	ts.NoError(err)
+	replayer := worker.NewWorkflowReplayer()
+	replayer.RegisterWorkflowWithOptions(ts.workflows.ActivityCancelRepro, workflow.RegisterOptions{DisableAlreadyRegisteredCheck: true})
+	err = replayer.ReplayPartialWorkflowHistoryFromJSONFile(logger, "fixtures/activity.cancel.sm.repro.json", 12)
+	ts.NoError(err)
 }
 
 func (ts *IntegrationTestSuite) TestActivityCancelRepro() {
 	var expected []string
 	err := ts.executeWorkflow("test-activity-cancel-sm", ts.workflows.ActivityCancelRepro, &expected)
-	ts.Nil(err)
+	ts.NoError(err)
 	ts.EqualValues(expected, ts.activities.invoked())
 }
 
@@ -426,7 +445,7 @@ func (ts *IntegrationTestSuite) registerDomain() {
 			return
 		}
 	}
-	ts.Nil(err)
+	ts.NoError(err)
 	time.Sleep(domainCacheRefreshInterval) // wait for domain cache refresh on cadence-server
 	// bellow is used to guarantee domain is ready
 	var dummyReturn string
@@ -482,7 +501,61 @@ func (ts *IntegrationTestSuite) startWorkflowOptions(wfID string) client.StartWo
 	}
 }
 
-func (ts *IntegrationTestSuite) registerWorkflowsAndActivities() {
-	ts.workflows.register()
-	ts.activities.register()
+func (ts *IntegrationTestSuite) registerWorkflowsAndActivities(w worker.Worker) {
+	ts.workflows.register(w)
+	ts.activities.register(w)
+}
+
+var _ interceptors.WorkflowInterceptorFactory = (*tracingInterceptorFactory)(nil)
+
+type tracingInterceptorFactory struct {
+	sync.Mutex
+	// key is workflow id
+	instances map[string]*tracingInterceptor
+}
+
+func newtracingInterceptorFactory() *tracingInterceptorFactory {
+	return &tracingInterceptorFactory{instances: make(map[string]*tracingInterceptor)}
+}
+
+func (t *tracingInterceptorFactory) GetTrace(workflowType string) []string {
+	t.Mutex.Lock()
+	defer t.Mutex.Unlock()
+	if i, ok := t.instances[workflowType]; ok {
+		return i.trace
+	}
+	panic(fmt.Sprintf("Unknown workflowType %v, known types: %v", workflowType, t.instances))
+}
+func (t *tracingInterceptorFactory) NewInterceptor(info *workflow.Info, next interceptors.WorkflowInterceptor) interceptors.WorkflowInterceptor {
+	t.Mutex.Lock()
+	defer t.Mutex.Unlock()
+	result := &tracingInterceptor{
+		WorkflowInterceptorBase: interceptors.WorkflowInterceptorBase{Next: next},
+	}
+	t.instances[info.WorkflowType.Name] = result
+	return result
+}
+
+var _ interceptors.WorkflowInterceptor = (*tracingInterceptor)(nil)
+
+type tracingInterceptor struct {
+	interceptors.WorkflowInterceptorBase
+	trace []string
+}
+
+func (t *tracingInterceptor) ExecuteActivity(ctx workflow.Context, activityType string, args ...interface{}) workflow.Future {
+	t.trace = append(t.trace, "ExecuteActivity")
+	return t.Next.ExecuteActivity(ctx, activityType, args...)
+}
+
+func (t *tracingInterceptor) ExecuteChildWorkflow(ctx workflow.Context, childWorkflowType string, args ...interface{}) workflow.ChildWorkflowFuture {
+	t.trace = append(t.trace, "ExecuteChildWorkflow")
+	return t.Next.ExecuteChildWorkflow(ctx, childWorkflowType, args...)
+}
+
+func (t *tracingInterceptor) ExecuteWorkflow(ctx workflow.Context, workflowType string, args ...interface{}) []interface{} {
+	t.trace = append(t.trace, "ExecuteWorkflow begin")
+	result := t.Next.ExecuteWorkflow(ctx, workflowType, args...)
+	t.trace = append(t.trace, "ExecuteWorkflow end")
+	return result
 }
