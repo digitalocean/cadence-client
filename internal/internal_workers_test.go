@@ -1,4 +1,5 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2017-2020 Uber Technologies Inc.
+// Portions of the Software are attributed to Copyright (c) 2020 Temporal Technologies Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -102,7 +103,7 @@ func (s *WorkersTestSuite) TestWorkflowWorker() {
 	}
 	overrides := &workerOverrides{workflowTaskHandler: newSampleWorkflowTaskHandler()}
 	workflowWorker := newWorkflowWorkerInternal(
-		s.service, domain, executionParameters, nil, overrides, getHostEnvironment(),
+		s.service, domain, executionParameters, nil, overrides, newRegistry(),
 	)
 	workflowWorker.Start()
 	workflowWorker.Stop()
@@ -125,10 +126,10 @@ func (s *WorkersTestSuite) TestActivityWorker() {
 	}
 	overrides := &workerOverrides{activityTaskHandler: newSampleActivityTaskHandler()}
 	a := &greeterActivity{}
-	hostEnv := getHostEnvironment()
-	hostEnv.addActivity(a.ActivityType().Name, a)
+	registry := newRegistry()
+	registry.addActivityWithLock(a.ActivityType().Name, a)
 	activityWorker := newActivityWorker(
-		s.service, domain, executionParameters, overrides, hostEnv, nil,
+		s.service, domain, executionParameters, overrides, registry, nil,
 	)
 	activityWorker.Start()
 	activityWorker.Stop()
@@ -174,19 +175,16 @@ func (s *WorkersTestSuite) TestActivityWorkerStop() {
 	activityTaskHandler := newNoResponseActivityTaskHandler()
 	overrides := &workerOverrides{activityTaskHandler: activityTaskHandler}
 	a := &greeterActivity{}
-	hostEnv := getHostEnvironment()
-	hostEnv.addActivity(a.ActivityType().Name, a)
+	registry := newRegistry()
+	registry.addActivityWithLock(a.ActivityType().Name, a)
 	worker := newActivityWorker(
-		s.service, domain, executionParameters, overrides, hostEnv, nil,
+		s.service, domain, executionParameters, overrides, registry, nil,
 	)
 	worker.Start()
 	activityTaskHandler.BlockedOnExecuteCalled()
 	go worker.Stop()
 
-	activityWorker, ok := worker.(*activityWorker)
-	s.Equal(true, ok)
-
-	<-activityWorker.worker.shutdownCh
+	<-worker.worker.shutdownCh
 	err := ctx.Err()
 	s.NoError(err)
 
@@ -208,7 +206,7 @@ func (s *WorkersTestSuite) TestPollForDecisionTask_InternalServiceError() {
 	}
 	overrides := &workerOverrides{workflowTaskHandler: newSampleWorkflowTaskHandler()}
 	workflowWorker := newWorkflowWorkerInternal(
-		s.service, domain, executionParameters, nil, overrides, getHostEnvironment(),
+		s.service, domain, executionParameters, nil, overrides, newRegistry(),
 	)
 	workflowWorker.Start()
 	workflowWorker.Stop()
@@ -240,11 +238,6 @@ func (s *WorkersTestSuite) TestLongRunningDecisionTask() {
 		isWorkflowCompleted = true
 		return err
 	}
-
-	RegisterWorkflowWithOptions(
-		longDecisionWorkflowFn,
-		RegisterWorkflowOptions{Name: "long-running-decision-workflow-type"},
-	)
 
 	domain := "testDomain"
 	taskList := "long-running-decision-tl"
@@ -337,6 +330,12 @@ func (s *WorkersTestSuite) TestLongRunningDecisionTask() {
 		Identity:              "test-worker-identity",
 	}
 	worker := newAggregatedWorker(s.service, domain, taskList, options)
+	worker.RegisterWorkflowWithOptions(
+		longDecisionWorkflowFn,
+		RegisterWorkflowOptions{Name: "long-running-decision-workflow-type"},
+	)
+	worker.RegisterActivity(localActivitySleep)
+
 	worker.Start()
 	// wait for test to complete
 	select {
@@ -376,11 +375,6 @@ func (s *WorkersTestSuite) TestMultipleLocalActivities() {
 		isWorkflowCompleted = true
 		return err
 	}
-
-	RegisterWorkflowWithOptions(
-		longDecisionWorkflowFn,
-		RegisterWorkflowOptions{Name: "multiple-local-activities-workflow-type"},
-	)
 
 	domain := "testDomain"
 	taskList := "multiple-local-activities-tl"
@@ -465,6 +459,12 @@ func (s *WorkersTestSuite) TestMultipleLocalActivities() {
 		Identity:              "test-worker-identity",
 	}
 	worker := newAggregatedWorker(s.service, domain, taskList, options)
+	worker.RegisterWorkflowWithOptions(
+		longDecisionWorkflowFn,
+		RegisterWorkflowOptions{Name: "multiple-local-activities-workflow-type"},
+	)
+	worker.RegisterActivity(localActivitySleep)
+
 	worker.Start()
 	// wait for test to complete
 	select {

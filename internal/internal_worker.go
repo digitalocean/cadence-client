@@ -1,4 +1,5 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2017-2020 Uber Technologies Inc.
+// Portions of the Software are attributed to Copyright (c) 2020 Temporal Technologies Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -23,11 +24,9 @@ package internal
 // All code in this file is private to the package.
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -39,15 +38,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pborman/uuid"
 	"github.com/uber-go/tally"
 	"go.uber.org/cadence/.gen/go/cadence/workflowserviceclient"
 	"go.uber.org/cadence/.gen/go/shared"
-	"go.uber.org/cadence/internal/common"
 	"go.uber.org/cadence/internal/common/backoff"
 	"go.uber.org/cadence/internal/common/metrics"
+	"go.uber.org/cadence/internal/common/util"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -74,9 +72,6 @@ const (
 
 	testTagsContextKey = "cadence-testTags"
 )
-
-// Assert that structs do indeed implement the interfaces
-var _ Worker = (*aggregatedWorker)(nil)
 
 type (
 	// WorkflowWorker wraps the code for hosting workflow types.
@@ -109,8 +104,8 @@ type (
 	// activities within a session. The creationWorker polls from a global tasklist,
 	// while the activityWorker polls from a resource specific tasklist.
 	sessionWorker struct {
-		creationWorker Worker
-		activityWorker Worker
+		creationWorker *activityWorker
+		activityWorker *activityWorker
 	}
 
 	// Worker overrides.
@@ -191,6 +186,8 @@ type (
 		ContextPropagators []ContextPropagator
 
 		Tracer opentracing.Tracer
+
+		WorkflowInterceptors []WorkflowInterceptorFactory
 	}
 )
 
@@ -200,9 +197,9 @@ func newWorkflowWorker(
 	domain string,
 	params workerExecutionParameters,
 	ppMgr pressurePointMgr,
-	hostEnv *hostEnvImpl,
-) Worker {
-	return newWorkflowWorkerInternal(service, domain, params, ppMgr, nil, hostEnv)
+	registry *registry,
+) *workflowWorker {
+	return newWorkflowWorkerInternal(service, domain, params, ppMgr, nil, registry)
 }
 
 func ensureRequiredParams(params *workerExecutionParameters) {
@@ -267,8 +264,8 @@ func newWorkflowWorkerInternal(
 	params workerExecutionParameters,
 	ppMgr pressurePointMgr,
 	overrides *workerOverrides,
-	hostEnv *hostEnvImpl,
-) Worker {
+	registry *registry,
+) *workflowWorker {
 	workerStopChannel := make(chan struct{})
 	params.WorkerStopChannel = getReadOnlyChannel(workerStopChannel)
 	// Get a workflow task handler.
@@ -277,7 +274,7 @@ func newWorkflowWorkerInternal(
 	if overrides != nil && overrides.workflowTaskHandler != nil {
 		taskHandler = overrides.workflowTaskHandler
 	} else {
-		taskHandler = newWorkflowTaskHandler(domain, params, ppMgr, hostEnv)
+		taskHandler = newWorkflowTaskHandler(domain, params, ppMgr, registry)
 	}
 	return newWorkflowTaskWorkerInternal(taskHandler, service, domain, params, workerStopChannel)
 }
@@ -288,7 +285,7 @@ func newWorkflowTaskWorkerInternal(
 	domain string,
 	params workerExecutionParameters,
 	stopC chan struct{},
-) Worker {
+) *workflowWorker {
 	ensureRequiredParams(&params)
 	poller := newWorkflowTaskPoller(
 		taskHandler,
@@ -381,9 +378,9 @@ func newSessionWorker(service workflowserviceclient.Interface,
 	domain string,
 	params workerExecutionParameters,
 	overrides *workerOverrides,
-	env *hostEnvImpl,
+	env *registry,
 	maxConcurrentSessionExecutionSize int,
-) Worker {
+) *sessionWorker {
 	if params.Identity == "" {
 		params.Identity = getWorkerIdentity(params.TaskList)
 	}
@@ -440,9 +437,9 @@ func newActivityWorker(
 	domain string,
 	params workerExecutionParameters,
 	overrides *workerOverrides,
-	env *hostEnvImpl,
+	env *registry,
 	sessionTokenBucket *sessionTokenBucket,
-) Worker {
+) *activityWorker {
 	workerStopChannel := make(chan struct{}, 1)
 	params.WorkerStopChannel = getReadOnlyChannel(workerStopChannel)
 	ensureRequiredParams(&params)
@@ -464,7 +461,7 @@ func newActivityTaskWorker(
 	workerParams workerExecutionParameters,
 	sessionTokenBucket *sessionTokenBucket,
 	stopC chan struct{},
-) (worker Worker) {
+) (worker *activityWorker) {
 	ensureRequiredParams(&workerParams)
 
 	poller := newActivityTaskPoller(
@@ -527,205 +524,6 @@ func (aw *activityWorker) Stop() {
 	aw.worker.Stop()
 }
 
-// hostEnvImpl is the implementation of hostEnv
-type hostEnvImpl struct {
-	sync.Mutex
-	workflowFuncMap  map[string]interface{}
-	workflowAliasMap map[string]string
-	activityFuncMap  map[string]activity
-	activityAliasMap map[string]string
-}
-
-func (th *hostEnvImpl) RegisterWorkflow(af interface{}) error {
-	return th.RegisterWorkflowWithOptions(af, RegisterWorkflowOptions{})
-}
-
-func (th *hostEnvImpl) RegisterWorkflowWithOptions(
-	af interface{},
-	options RegisterWorkflowOptions,
-) error {
-	// Validate that it is a function
-	fnType := reflect.TypeOf(af)
-	if err := validateFnFormat(fnType, true); err != nil {
-		return err
-	}
-	fnName := getFunctionName(af)
-	alias := options.Name
-	registerName := fnName
-	if len(alias) > 0 {
-		registerName = alias
-	}
-	// Check if already registered
-	if _, ok := th.getWorkflowFn(registerName); ok {
-		return fmt.Errorf("workflow name \"%v\" is already registered", registerName)
-	}
-	th.addWorkflowFn(registerName, af)
-	if len(alias) > 0 {
-		th.addWorkflowAlias(fnName, alias)
-	}
-	return nil
-}
-
-func (th *hostEnvImpl) RegisterActivity(af interface{}) error {
-	return th.RegisterActivityWithOptions(af, RegisterActivityOptions{})
-}
-
-func (th *hostEnvImpl) RegisterActivityWithOptions(
-	af interface{},
-	options RegisterActivityOptions,
-) error {
-	// Validate that it is a function
-	fnType := reflect.TypeOf(af)
-	if err := validateFnFormat(fnType, false); err != nil {
-		return err
-	}
-	fnName := getFunctionName(af)
-	alias := options.Name
-	registerName := fnName
-	if len(alias) > 0 {
-		registerName = alias
-	}
-	// Check if already registered
-	if _, ok := th.getActivityFn(registerName); ok {
-		return fmt.Errorf("activity type \"%v\" is already registered", registerName)
-	}
-	th.addActivityFn(registerName, af)
-	if len(alias) > 0 {
-		th.addActivityAlias(fnName, alias)
-	}
-	return nil
-}
-
-func (th *hostEnvImpl) addWorkflowAlias(fnName string, alias string) {
-	th.Lock()
-	defer th.Unlock()
-	th.workflowAliasMap[fnName] = alias
-}
-
-func (th *hostEnvImpl) getWorkflowAlias(fnName string) (string, bool) {
-	th.Lock()
-	defer th.Unlock()
-	alias, ok := th.workflowAliasMap[fnName]
-	return alias, ok
-}
-
-func (th *hostEnvImpl) addWorkflowFn(fnName string, wf interface{}) {
-	th.Lock()
-	defer th.Unlock()
-	th.workflowFuncMap[fnName] = wf
-}
-
-func (th *hostEnvImpl) getWorkflowFn(fnName string) (interface{}, bool) {
-	th.Lock()
-	defer th.Unlock()
-	fn, ok := th.workflowFuncMap[fnName]
-	return fn, ok
-}
-
-func (th *hostEnvImpl) getRegisteredWorkflowTypes() []string {
-	th.Lock()
-	defer th.Unlock()
-	var r []string
-	for t := range th.workflowFuncMap {
-		r = append(r, t)
-	}
-	return r
-}
-
-func (th *hostEnvImpl) addActivityAlias(fnName string, alias string) {
-	th.Lock()
-	defer th.Unlock()
-	th.activityAliasMap[fnName] = alias
-}
-
-func (th *hostEnvImpl) getActivityAlias(fnName string) (string, bool) {
-	th.Lock()
-	defer th.Unlock()
-	alias, ok := th.activityAliasMap[fnName]
-	return alias, ok
-}
-
-func (th *hostEnvImpl) addActivity(fnName string, a activity) {
-	th.Lock()
-	defer th.Unlock()
-	th.activityFuncMap[fnName] = a
-}
-
-func (th *hostEnvImpl) addActivityFn(fnName string, af interface{}) {
-	th.addActivity(fnName, &activityExecutor{fnName, af})
-}
-
-func (th *hostEnvImpl) getActivity(fnName string) (activity, bool) {
-	th.Lock()
-	defer th.Unlock()
-	a, ok := th.activityFuncMap[fnName]
-	return a, ok
-}
-
-func (th *hostEnvImpl) getActivityFn(fnName string) (interface{}, bool) {
-	if a, ok := th.getActivity(fnName); ok {
-		return a.GetFunction(), ok
-	}
-	return nil, false
-}
-
-func (th *hostEnvImpl) getRegisteredActivities() []activity {
-	th.Lock()
-	defer th.Unlock()
-	activities := make([]activity, 0, len(th.activityFuncMap))
-	for _, a := range th.activityFuncMap {
-		activities = append(activities, a)
-	}
-	return activities
-}
-
-func isUseThriftEncoding(objs []interface{}) bool {
-	// NOTE: our criteria to use which encoder is simple if all the types are serializable using thrift then we use
-	// thrift encoder. For everything else we default to gob.
-
-	if len(objs) == 0 {
-		return false
-	}
-
-	for i := 0; i < len(objs); i++ {
-		if !isThriftType(objs[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func isUseThriftDecoding(objs []interface{}) bool {
-	// NOTE: our criteria to use which encoder is simple if all the types are de-serializable using thrift then we use
-	// thrift decoder. For everything else we default to gob.
-
-	if len(objs) == 0 {
-		return false
-	}
-
-	for i := 0; i < len(objs); i++ {
-		rVal := reflect.ValueOf(objs[i])
-		if rVal.Kind() != reflect.Ptr || !isThriftType(reflect.Indirect(rVal).Interface()) {
-			return false
-		}
-	}
-	return true
-}
-
-func (th *hostEnvImpl) getWorkflowDefinition(wt WorkflowType) (workflowDefinition, error) {
-	lookup := wt.Name
-	if alias, ok := th.getWorkflowAlias(lookup); ok {
-		lookup = alias
-	}
-	wf, ok := th.getWorkflowFn(lookup)
-	if !ok {
-		supported := strings.Join(th.getRegisteredWorkflowTypes(), ", ")
-		return nil, fmt.Errorf("unable to find workflow type: %v. Supported types: [%v]", lookup, supported)
-	}
-	wd := &workflowExecutor{name: lookup, fn: wf}
-	return newWorkflowDefinition(wd), nil
-}
-
 // Validate function parameters.
 func validateFnFormat(fnType reflect.Type, isWorkflow bool) error {
 	if fnType.Kind() != reflect.Func {
@@ -775,10 +573,20 @@ func encodeArgs(dc DataConverter, args []interface{}) ([]byte, error) {
 
 // decode multiple arguments(arguments to a function).
 func decodeArgs(dc DataConverter, fnType reflect.Type, data []byte) (result []reflect.Value, err error) {
+	r, err := decodeArgsToValues(dc, fnType, data)
+	if err != nil {
+		return
+	}
+	for i := 0; i < len(r); i++ {
+		result = append(result, reflect.ValueOf(r[i]).Elem())
+	}
+	return
+}
+
+func decodeArgsToValues(dc DataConverter, fnType reflect.Type, data []byte) (result []interface{}, err error) {
 	if dc == nil {
 		dc = getDefaultDataConverter()
 	}
-	var r []interface{}
 argsLoop:
 	for i := 0; i < fnType.NumIn(); i++ {
 		argT := fnType.In(i)
@@ -786,14 +594,11 @@ argsLoop:
 			continue argsLoop
 		}
 		arg := reflect.New(argT).Interface()
-		r = append(r, arg)
+		result = append(result, arg)
 	}
-	err = dc.FromData(data, r...)
+	err = dc.FromData(data, result...)
 	if err != nil {
 		return
-	}
-	for i := 0; i < len(r); i++ {
-		result = append(result, reflect.ValueOf(r[i]).Elem())
 	}
 	return
 }
@@ -837,63 +642,32 @@ func decodeAndAssignValue(dc DataConverter, from interface{}, toValuePtr interfa
 	return nil
 }
 
-var typeOfByteSlice = reflect.TypeOf(([]byte)(nil))
-
-func isTypeByteSlice(inType reflect.Type) bool {
-	return inType == typeOfByteSlice || inType == reflect.PtrTo(typeOfByteSlice)
-}
-
-var once sync.Once
-
-// Singleton to hold the host registration details.
-var thImpl *hostEnvImpl
-
-func newHostEnvironment() *hostEnvImpl {
-	return &hostEnvImpl{
-		workflowFuncMap:  make(map[string]interface{}),
-		workflowAliasMap: make(map[string]string),
-		activityFuncMap:  make(map[string]activity),
-		activityAliasMap: make(map[string]string),
-	}
-}
-
-func getHostEnvironment() *hostEnvImpl {
-	once.Do(func() {
-		thImpl = newHostEnvironment()
-	})
-	return thImpl
-}
-
 // Wrapper to execute workflow functions.
 type workflowExecutor struct {
-	name string
-	fn   interface{}
+	workflowType string
+	fn           interface{}
 }
 
 func (we *workflowExecutor) Execute(ctx Context, input []byte) ([]byte, error) {
-	fnType := reflect.TypeOf(we.fn)
-	// Workflow context.
-	args := []reflect.Value{reflect.ValueOf(ctx)}
-
+	var args []interface{}
 	dataConverter := getWorkflowEnvOptions(ctx).dataConverter
-	if fnType.NumIn() > 1 && isTypeByteSlice(fnType.In(1)) {
-		// 0 - is workflow context.
-		// 1 ... input types.
-		args = append(args, reflect.ValueOf(input))
+	fnType := reflect.TypeOf(we.fn)
+	if fnType.NumIn() == 2 && util.IsTypeByteSlice(fnType.In(1)) {
+		// Do not deserialize input if workflow has a single byte slice argument (besides ctx)
+		args = append(args, input)
 	} else {
-		decoded, err := decodeArgs(dataConverter, fnType, input)
+		decoded, err := decodeArgsToValues(dataConverter, fnType, input)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"unable to decode the workflow function input bytes with error: %v, function name: %v",
-				err, we.name)
+				err, we.workflowType)
 		}
 		args = append(args, decoded...)
 	}
-
-	// Invoke the workflow with arguments.
-	fnValue := reflect.ValueOf(we.fn)
-	retValues := fnValue.Call(args)
-	return validateFunctionAndGetResults(we.fn, retValues, dataConverter)
+	envInterceptor := getEnvInterceptor(ctx)
+	envInterceptor.fn = we.fn
+	results := envInterceptor.interceptorChainHead.ExecuteWorkflow(ctx, we.workflowType, args...)
+	return serializeResults(we.fn, results, dataConverter)
 }
 
 // Wrapper to execute activity functions.
@@ -912,7 +686,7 @@ func (ae *activityExecutor) GetFunction() interface{} {
 
 func (ae *activityExecutor) Execute(ctx context.Context, input []byte) ([]byte, error) {
 	fnType := reflect.TypeOf(ae.fn)
-	args := []reflect.Value{}
+	var args []reflect.Value
 	dataConverter := getDataConverterFromActivityCtx(ctx)
 
 	// activities optionally might not take context.
@@ -920,7 +694,7 @@ func (ae *activityExecutor) Execute(ctx context.Context, input []byte) ([]byte, 
 		args = append(args, reflect.ValueOf(ctx))
 	}
 
-	if fnType.NumIn() == 1 && isTypeByteSlice(fnType.In(0)) {
+	if fnType.NumIn() == 1 && util.IsTypeByteSlice(fnType.In(0)) {
 		args = append(args, reflect.ValueOf(input))
 	} else {
 		decoded, err := decodeArgs(dataConverter, fnType, input)
@@ -981,11 +755,27 @@ func getDataConverterFromActivityCtx(ctx context.Context) DataConverter {
 
 // aggregatedWorker combines management of both workflowWorker and activityWorker worker lifecycle.
 type aggregatedWorker struct {
-	workflowWorker Worker
-	activityWorker Worker
-	sessionWorker  Worker
+	workflowWorker *workflowWorker
+	activityWorker *activityWorker
+	sessionWorker  *sessionWorker
 	logger         *zap.Logger
-	hostEnv        *hostEnvImpl
+	registry       *registry
+}
+
+func (aw *aggregatedWorker) RegisterWorkflow(w interface{}) {
+	aw.registry.RegisterWorkflow(w)
+}
+
+func (aw *aggregatedWorker) RegisterWorkflowWithOptions(w interface{}, options RegisterWorkflowOptions) {
+	aw.registry.RegisterWorkflowWithOptions(w, options)
+}
+
+func (aw *aggregatedWorker) RegisterActivity(a interface{}) {
+	aw.registry.RegisterActivity(a)
+}
+
+func (aw *aggregatedWorker) RegisterActivityWithOptions(a interface{}, options RegisterActivityOptions) {
+	aw.registry.RegisterActivityWithOptions(a, options)
 }
 
 func (aw *aggregatedWorker) Start() error {
@@ -994,7 +784,7 @@ func (aw *aggregatedWorker) Start() error {
 	}
 
 	if !isInterfaceNil(aw.workflowWorker) {
-		if len(aw.hostEnv.getRegisteredWorkflowTypes()) == 0 {
+		if len(aw.registry.getRegisteredWorkflowTypes()) == 0 {
 			aw.logger.Warn(
 				"Starting worker without any workflows. Workflows must be registered before start.",
 			)
@@ -1004,7 +794,7 @@ func (aw *aggregatedWorker) Start() error {
 		}
 	}
 	if !isInterfaceNil(aw.activityWorker) {
-		if len(aw.hostEnv.getRegisteredActivities()) == 0 {
+		if len(aw.registry.getRegisteredActivities()) == 0 {
 			aw.logger.Warn(
 				"Starting worker without any activities. Activities must be registered before start.",
 			)
@@ -1120,13 +910,15 @@ func (aw *aggregatedWorker) Stop() {
 	aw.logger.Info("Stopped Worker")
 }
 
-// aggregatedWorker returns an instance to manage both activity and decision workers
+// AggregatedWorker returns an instance to manage the workers. Use defaultConcurrentPollRoutineSize (which is 2) as
+// poller size. The typical RTT (round-trip time) is below 1ms within data center. And the poll API latency is about 5ms.
+// With 2 poller, we could achieve around 300~400 RPS.
 func newAggregatedWorker(
 	service workflowserviceclient.Interface,
 	domain string,
 	taskList string,
 	options WorkerOptions,
-) (worker Worker) {
+) (worker *aggregatedWorker) {
 	wOptions := augmentWorkerOptions(options)
 	ctx := wOptions.BackgroundActivityContext
 	if ctx == nil {
@@ -1158,6 +950,7 @@ func newAggregatedWorker(
 		WorkerStopTimeout:                    wOptions.WorkerStopTimeout,
 		ContextPropagators:                   wOptions.ContextPropagators,
 		Tracer:                               wOptions.Tracer,
+		WorkflowInterceptors:                 wOptions.WorkflowInterceptorChainFactories,
 	}
 
 	ensureRequiredParams(&workerParams)
@@ -1172,9 +965,11 @@ func newAggregatedWorker(
 
 	processTestTags(&wOptions, &workerParams)
 
-	hostEnv := getHostEnvironment()
+	// worker specific registry
+	registry := newRegistry()
+
 	// workflow factory.
-	var workflowWorker Worker
+	var workflowWorker *workflowWorker
 	if !wOptions.DisableWorkflowWorker {
 		testTags := getTestTags(wOptions.BackgroundActivityContext)
 		if testTags != nil && len(testTags) > 0 {
@@ -1183,7 +978,7 @@ func newAggregatedWorker(
 				domain,
 				workerParams,
 				testTags,
-				hostEnv,
+				registry,
 			)
 		} else {
 			workflowWorker = newWorkflowWorker(
@@ -1191,13 +986,13 @@ func newAggregatedWorker(
 				domain,
 				workerParams,
 				nil,
-				hostEnv,
+				registry,
 			)
 		}
 	}
 
 	// activity types.
-	var activityWorker Worker
+	var activityWorker *activityWorker
 
 	if !wOptions.DisableActivityWorker {
 		activityWorker = newActivityWorker(
@@ -1205,21 +1000,28 @@ func newAggregatedWorker(
 			domain,
 			workerParams,
 			nil,
-			hostEnv,
+			registry,
 			nil,
 		)
 	}
 
-	var sessionWorker Worker
+	var sessionWorker *sessionWorker
 	if wOptions.EnableSessionWorker {
 		sessionWorker = newSessionWorker(
 			service,
 			domain,
 			workerParams,
 			nil,
-			hostEnv,
+			registry,
 			wOptions.MaxConcurrentSessionExecutionSize,
 		)
+		registry.RegisterActivityWithOptions(sessionCreationActivity, RegisterActivityOptions{
+			Name: sessionCreationActivityName,
+		})
+		registry.RegisterActivityWithOptions(sessionCompletionActivity, RegisterActivityOptions{
+			Name: sessionCompletionActivityName,
+		})
+
 	}
 
 	return &aggregatedWorker{
@@ -1227,7 +1029,7 @@ func newAggregatedWorker(
 		activityWorker: activityWorker,
 		sessionWorker:  sessionWorker,
 		logger:         logger,
-		hostEnv:        hostEnv,
+		registry:       registry,
 	}
 }
 
@@ -1285,7 +1087,28 @@ func isError(inType reflect.Type) bool {
 }
 
 func getFunctionName(i interface{}) string {
-	return runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+	fullName, ok := i.(string)
+	if !ok {
+		fullName = runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+	}
+	elements := strings.Split(fullName, ".")
+	return elements[len(elements)-1]
+}
+
+func getActivityFunctionName(r *registry, i interface{}) string {
+	result := getFunctionName(i)
+	if alias, ok := r.getActivityAlias(result); ok {
+		result = alias
+	}
+	return result
+}
+
+func getWorkflowFunctionName(r *registry, i interface{}) string {
+	result := getFunctionName(i)
+	if alias, ok := r.getWorkflowAlias(result); ok {
+		result = alias
+	}
+	return result
 }
 
 func isInterfaceNil(i interface{}) bool {
@@ -1294,94 +1117,6 @@ func isInterfaceNil(i interface{}) bool {
 
 func getReadOnlyChannel(c chan struct{}) <-chan struct{} {
 	return c
-}
-
-// encoding is capable of encoding and decoding objects
-type encoding interface {
-	Marshal([]interface{}) ([]byte, error)
-	Unmarshal([]byte, []interface{}) error
-}
-
-// jsonEncoding encapsulates json encoding and decoding
-type jsonEncoding struct {
-}
-
-// Marshal encodes an array of object into bytes
-func (g jsonEncoding) Marshal(objs []interface{}) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for i, obj := range objs {
-		if err := enc.Encode(obj); err != nil {
-			if err == io.EOF {
-				return nil, fmt.Errorf("missing argument at index %d of type %T", i, obj)
-			}
-			return nil, fmt.Errorf(
-				"unable to encode argument: %d, %v, with json error: %v", i, reflect.TypeOf(obj), err)
-		}
-	}
-	return buf.Bytes(), nil
-}
-
-// Unmarshal decodes a byte array into the passed in objects
-func (g jsonEncoding) Unmarshal(data []byte, objs []interface{}) error {
-	dec := json.NewDecoder(bytes.NewBuffer(data))
-	for i, obj := range objs {
-		if err := dec.Decode(obj); err != nil {
-			return fmt.Errorf(
-				"unable to decode argument: %d, %v, with json error: %v", i, reflect.TypeOf(obj), err)
-		}
-	}
-	return nil
-}
-
-func isThriftType(v interface{}) bool {
-	// NOTE: Thrift serialization works only if the values are pointers.
-	// Thrift has a validation that it meets thift.TStruct which has Read/Write pointer receivers.
-
-	if reflect.ValueOf(v).Kind() != reflect.Ptr {
-		return false
-	}
-	t := reflect.TypeOf((*thrift.TStruct)(nil)).Elem()
-	return reflect.TypeOf(v).Implements(t)
-}
-
-// thriftEncoding encapsulates thrift serializer/de-serializer.
-type thriftEncoding struct{}
-
-// Marshal encodes an array of thrift into bytes
-func (g thriftEncoding) Marshal(objs []interface{}) ([]byte, error) {
-	tlist := []thrift.TStruct{}
-	for i := 0; i < len(objs); i++ {
-		if !isThriftType(objs[i]) {
-			return nil, fmt.Errorf("pointer to thrift.TStruct type is required for %v argument", i+1)
-		}
-		t := reflect.ValueOf(objs[i]).Interface().(thrift.TStruct)
-		tlist = append(tlist, t)
-	}
-	return common.TListSerialize(tlist)
-}
-
-// Unmarshal decodes an array of thrift into bytes
-func (g thriftEncoding) Unmarshal(data []byte, objs []interface{}) error {
-	tlist := []thrift.TStruct{}
-	for i := 0; i < len(objs); i++ {
-		rVal := reflect.ValueOf(objs[i])
-		if rVal.Kind() != reflect.Ptr || !isThriftType(reflect.Indirect(rVal).Interface()) {
-			return fmt.Errorf("pointer to pointer thrift.TStruct type is required for %v argument", i+1)
-		}
-		t := reflect.New(rVal.Elem().Type().Elem()).Interface().(thrift.TStruct)
-		tlist = append(tlist, t)
-	}
-
-	if err := common.TListDeserialize(tlist, data); err != nil {
-		return err
-	}
-
-	for i := 0; i < len(tlist); i++ {
-		reflect.ValueOf(objs[i]).Elem().Set(reflect.ValueOf(tlist[i]))
-	}
-
-	return nil
 }
 
 func augmentWorkerOptions(options WorkerOptions) WorkerOptions {
