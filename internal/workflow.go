@@ -226,7 +226,10 @@ type (
 
 // RegisterWorkflowOptions consists of options for registering a workflow
 type RegisterWorkflowOptions struct {
-	Name                          string
+	Name string
+	// Workflow type name is equal to function name instead of fully qualified name including function package.
+	// This option has no effect when explicit Name is provided.
+	EnableShortName               bool
 	DisableAlreadyRegisteredCheck bool
 }
 
@@ -518,13 +521,13 @@ func ExecuteLocalActivity(ctx Context, activity interface{}, args ...interface{}
 }
 
 func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, activityType string, args ...interface{}) Future {
+	header := getHeadersFromContext(ctx)
 	activityFn := ctx.Value(localActivityFnContextKey)
 	if activityFn == nil {
 		panic("ExecuteLocalActivity: Expected context key " + localActivityFnContextKey + " is missing")
 	}
 
 	future, settable := newDecodeFuture(ctx, activityFn)
-
 	if err := validateFunctionArgs(activityFn, args, false); err != nil {
 		settable.Set(nil, err)
 		return future
@@ -542,6 +545,7 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, acti
 		WorkflowInfo:         GetWorkflowInfo(ctx),
 		DataConverter:        getDataConverterFromWorkflowContext(ctx),
 		ScheduledTime:        Now(ctx), // initial scheduled time
+		Header:               header,
 	}
 
 	Go(ctx, func(ctx Context) {
@@ -737,6 +741,14 @@ type WorkflowInfo struct {
 	Memo                                *s.Memo             // Value can be decoded using data converter (DefaultDataConverter, or custom one if set).
 	SearchAttributes                    *s.SearchAttributes // Value can be decoded using DefaultDataConverter.
 	BinaryChecksum                      *string
+	RetryPolicy                         *s.RetryPolicy
+}
+
+func (wInfo *WorkflowInfo) GetBinaryChecksum() string {
+	if wInfo.BinaryChecksum == nil {
+		return getBinaryChecksum()
+	}
+	return *wInfo.BinaryChecksum
 }
 
 // GetWorkflowInfo extracts info of a current workflow from a context.

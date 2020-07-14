@@ -452,8 +452,10 @@ func (w *Workflows) RetryTimeoutStableErrorWorkflow(ctx workflow.Context) ([]str
 		},
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
-
-	err := workflow.ExecuteActivity(ctx, "Activities_RetryTimeoutStableErrorActivity").Get(ctx, nil)
+	// Test calling activity by method pointer
+	// As Go allows nil receiver pointers it works fine
+	var a *Activities
+	err := workflow.ExecuteActivity(ctx, a.RetryTimeoutStableErrorActivity).Get(ctx, nil)
 
 	cerr, ok := err.(*cadence.CustomError)
 	if !ok {
@@ -511,9 +513,21 @@ func (w *Workflows) InspectLocalActivityInfo(ctx workflow.Context) error {
 	wfType := info.WorkflowType.Name
 	taskList := info.TaskListName
 	ctx = workflow.WithLocalActivityOptions(ctx, w.defaultLocalActivityOptions())
-	activites := Activities{}
+	activities := Activities{}
 	return workflow.ExecuteLocalActivity(
-		ctx, activites.InspectActivityInfo, domain, taskList, wfType).Get(ctx, nil)
+		ctx, activities.InspectActivityInfo, domain, taskList, wfType).Get(ctx, nil)
+}
+
+func (w *Workflows) WorkflowWithLocalActivityCtxPropagation(ctx workflow.Context) (string, error) {
+	ctx = workflow.WithLocalActivityOptions(ctx, w.defaultLocalActivityOptions())
+	ctx = workflow.WithValue(ctx, contextKey(testContextKey), "test-data-in-context")
+	activities := Activities{}
+	var result string
+	err := workflow.ExecuteLocalActivity(ctx, activities.DuplicateStringInContext).Get(ctx, &result)
+	if err != nil {
+		return "", err
+	}
+	return result, nil
 }
 
 func (w *Workflows) register(worker worker.Worker) {
@@ -541,6 +555,7 @@ func (w *Workflows) register(worker worker.Worker) {
 	worker.RegisterWorkflow(w.LargeQueryResultWorkflow)
 	worker.RegisterWorkflow(w.RetryTimeoutStableErrorWorkflow)
 	worker.RegisterWorkflow(w.ConsistentQueryWorkflow)
+	worker.RegisterWorkflow(w.WorkflowWithLocalActivityCtxPropagation)
 
 }
 

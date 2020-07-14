@@ -1087,12 +1087,19 @@ func isError(inType reflect.Type) bool {
 }
 
 func getFunctionName(i interface{}) string {
-	fullName, ok := i.(string)
-	if !ok {
-		fullName = runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+	if fullName, ok := i.(string); ok {
+		return fullName
 	}
-	elements := strings.Split(fullName, ".")
-	return elements[len(elements)-1]
+	fullName := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+	// This allows to call activities by method pointer
+	// Compiler adds -fm suffix to a function name which has a receiver
+	// Note that this works even if struct pointer used to get the function is nil
+	// It is possible because nil receivers are allowed.
+	// For example:
+	// var a *Activities
+	// ExecuteActivity(ctx, a.Foo)
+	// will call this function which is going to return "Foo"
+	return strings.TrimSuffix(fullName, "-fm")
 }
 
 func getActivityFunctionName(r *registry, i interface{}) string {

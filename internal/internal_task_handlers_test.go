@@ -358,9 +358,9 @@ func (t *TaskHandlersTestSuite) TestWorkflowTask_BinaryChecksum() {
 	t.NotNil(response)
 	t.Equal(1, len(response.Decisions))
 	t.Equal(s.DecisionTypeCompleteWorkflowExecution, response.Decisions[0].GetDecisionType())
-	checksumsJSON := string(response.Decisions[0].CompleteWorkflowExecutionDecisionAttributes.Result)
+	checksumsBytes := response.Decisions[0].CompleteWorkflowExecutionDecisionAttributes.Result
 	var checksums []string
-	json.Unmarshal([]byte(checksumsJSON), &checksums)
+	json.Unmarshal(checksumsBytes, &checksums)
 	t.Equal(3, len(checksums))
 	t.Equal("chck1", checksums[0])
 	t.Equal("chck2", checksums[1])
@@ -858,6 +858,12 @@ func (t *TaskHandlersTestSuite) TestGetWorkflowInfo() {
 	workflowType := "GetWorkflowInfoWorkflow"
 	lastCompletionResult, err := getDefaultDataConverter().ToData("lastCompletionData")
 	t.NoError(err)
+	retryPolicy := &s.RetryPolicy{
+		InitialIntervalInSeconds: common.Int32Ptr(1),
+		BackoffCoefficient:       common.Float64Ptr(1.0),
+		MaximumIntervalInSeconds: common.Int32Ptr(1),
+		MaximumAttempts:          common.Int32Ptr(3),
+	}
 	startedEventAttributes := &s.WorkflowExecutionStartedEventAttributes{
 		Input:                               lastCompletionResult,
 		TaskList:                            &s.TaskList{Name: &taskList},
@@ -869,6 +875,7 @@ func (t *TaskHandlersTestSuite) TestGetWorkflowInfo() {
 		ExecutionStartToCloseTimeoutSeconds: &executionTimeout,
 		TaskStartToCloseTimeoutSeconds:      &taskTimeout,
 		LastCompletionResult:                lastCompletionResult,
+		RetryPolicy:                         retryPolicy,
 	}
 	testEvents := []*s.HistoryEvent{
 		createTestEventWorkflowExecutionStarted(1, startedEventAttributes),
@@ -904,6 +911,7 @@ func (t *TaskHandlersTestSuite) TestGetWorkflowInfo() {
 	t.EqualValues(taskTimeout, result.TaskStartToCloseTimeoutSeconds)
 	t.EqualValues(workflowType, result.WorkflowType.Name)
 	t.EqualValues(testDomain, result.Domain)
+	t.EqualValues(retryPolicy, result.RetryPolicy)
 }
 
 func (t *TaskHandlersTestSuite) TestConsistentQuery_InvalidQueryTask() {
