@@ -27,9 +27,9 @@ import (
 	"context"
 
 	"github.com/stretchr/testify/mock"
-	"go.uber.org/cadence/.gen/go/shared"
 	"go.uber.org/cadence/client"
 	"go.uber.org/cadence/encoded"
+	"go.uber.org/cadence/gen/go/shared"
 	"go.uber.org/cadence/internal"
 	"go.uber.org/cadence/workflow"
 )
